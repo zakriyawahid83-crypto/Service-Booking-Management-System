@@ -25,6 +25,13 @@ app = FastAPI(
     title="Service Booking & Management Platform",
     version="1.0.0"
 )
+@app.middleware("http")
+async def fix_api_trailing_slash(request, call_next):
+    if request.method == "GET":
+        if request.url.path in {"/categories", "/services"}:
+            request.scope["path"] = request.url.path + "/"
+
+    return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,

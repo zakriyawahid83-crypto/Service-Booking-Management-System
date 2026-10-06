@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import bcrypt
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     HTTPException,
     status,
@@ -225,8 +226,8 @@ def login(
 
 @router.post("/forgot-password")
 def forgot_password(
-    email: str,
-    db: Session = Depends(get_db),
+     email: str = Body(..., embed=True),
+     db: Session = Depends(get_db),
 ):
     user = (
         db.query(User)

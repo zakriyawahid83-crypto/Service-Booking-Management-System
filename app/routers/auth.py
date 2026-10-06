@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta, timezone
 
+import os
 import bcrypt
+import resend
+
 from fastapi import (
     APIRouter,
     Body,
@@ -8,26 +11,27 @@ from fastapi import (
     HTTPException,
     status,
 )
+
 from fastapi.security import (
     HTTPAuthorizationCredentials,
     HTTPBearer,
 )
+
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+
 from app.auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     ALGORITHM,
     SECRET_KEY,
 )
+
 from app.models.user import User
 from app.models.provider import Provider
-import os
-import smtplib
-from email.message import EmailMessage
+
 from app.schemas.user import (
-    Token,
     UserCreate,
     UserLogin,
     UserResponse,
@@ -57,10 +61,6 @@ def register(
     user: UserCreate,
     db: Session = Depends(get_db),
 ):
-    # -----------------------------------------------------
-    # CHECK EXISTING USER
-    # -----------------------------------------------------
-
     existing_user = (
         db.query(User)
         .filter(User.email == user.email)
@@ -73,18 +73,10 @@ def register(
             detail="Email already registered",
         )
 
-    # -----------------------------------------------------
-    # HASH PASSWORD
-    # -----------------------------------------------------
-
     hashed_password = bcrypt.hashpw(
         user.password.encode("utf-8"),
         bcrypt.gensalt(),
     ).decode("utf-8")
-
-    # -----------------------------------------------------
-    # CREATE USER
-    # -----------------------------------------------------
 
     new_user = User(
         name=user.name,
@@ -99,14 +91,6 @@ def register(
     # -----------------------------------------------------
     # CREATE PROVIDER PROFILE
     # -----------------------------------------------------
-    # Every provider user must have a corresponding
-    # Provider record because provider routes use:
-    #
-    # Provider.user_id == current_user.id
-    #
-    # business_name is required in the Provider model,
-    # so initially we use the user's name.
-    # The provider can update it later from the dashboard.
 
     if user.role == "provider":
 
@@ -131,12 +115,9 @@ def register(
 
             db.add(provider)
 
-    # -----------------------------------------------------
-    # SAVE EVERYTHING
-    # -----------------------------------------------------
-
     try:
         db.commit()
+
     except Exception:
         db.rollback()
 
@@ -171,15 +152,12 @@ def login(
             detail="Invalid email or password",
         )
 
-    # -----------------------------------------------------
-    # VERIFY PASSWORD
-    # -----------------------------------------------------
-
     try:
         password_correct = bcrypt.checkpw(
             user.password.encode("utf-8"),
             db_user.hashed_password.encode("utf-8"),
         )
+
     except Exception:
         password_correct = False
 
@@ -226,19 +204,27 @@ def login(
 
 @router.post("/forgot-password")
 def forgot_password(
-     email: str = Body(..., embed=True),
-     db: Session = Depends(get_db),
+    email: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
 ):
     user = (
         db.query(User)
-        .filter(User.email == email.strip())
+        .filter(
+            User.email == email.strip()
+        )
         .first()
     )
 
-    # Do not reveal whether the email exists
+    # -----------------------------------------------------
+    # DO NOT REVEAL WHETHER EMAIL EXISTS
+    # -----------------------------------------------------
+
     if not user:
         return {
-            "message": "If this email exists, a password reset link has been sent."
+            "message": (
+                "If this email exists, "
+                "a password reset link has been sent."
+            )
         }
 
     # -----------------------------------------------------
@@ -263,7 +249,7 @@ def forgot_password(
     )
 
     # -----------------------------------------------------
-    # RESET URL
+    # FRONTEND RESET URL
     # -----------------------------------------------------
 
     frontend_url = os.getenv(
@@ -277,76 +263,109 @@ def forgot_password(
     )
 
     # -----------------------------------------------------
-    # EMAIL SETTINGS
+    # RESEND API KEY
     # -----------------------------------------------------
 
-    smtp_host = os.getenv("SMTP_HOST")
-    smtp_port = int(
-        os.getenv("SMTP_PORT", "587")
+    resend_api_key = os.getenv(
+        "RESEND_API_KEY"
     )
-    smtp_username = os.getenv("SMTP_USERNAME")
-    smtp_password = os.getenv("SMTP_PASSWORD")
 
-    if not all(
-        [
-            smtp_host,
-            smtp_username,
-            smtp_password,
-        ]
-    ):
+    if not resend_api_key:
         raise HTTPException(
             status_code=500,
-            detail="Email service is not configured.",
+            detail="Resend email service is not configured.",
         )
+
+    resend.api_key = resend_api_key
+
+    # -----------------------------------------------------
+    # EMAIL
+    # -----------------------------------------------------
+
+    params = {
+        "from": "onboarding@resend.dev",
+        "to": [user.email],
+        "subject": "Service Booking - Password Reset",
+        "html": f"""
+            <div
+                style="
+                    font-family: Arial, sans-serif;
+                    max-width: 600px;
+                    margin: 0 auto;
+                    padding: 30px;
+                    line-height: 1.6;
+                "
+            >
+
+                <h2>
+                    Password Reset
+                </h2>
+
+                <p>
+                    Hello {user.name},
+                </p>
+
+                <p>
+                    We received a request to reset
+                    your Service Booking password.
+                </p>
+
+                <p>
+                    Click the button below to reset
+                    your password:
+                </p>
+
+                <p>
+                    <a
+                        href="{reset_url}"
+                        style="
+                            display: inline-block;
+                            padding: 12px 22px;
+                            background: #2563eb;
+                            color: white;
+                            text-decoration: none;
+                            border-radius: 8px;
+                        "
+                    >
+                        Reset Password
+                    </a>
+                </p>
+
+                <p>
+                    This link will expire in
+                    30 minutes.
+                </p>
+
+                <p>
+                    If you did not request this,
+                    you can safely ignore this email.
+                </p>
+
+                <p>
+                    Regards,<br>
+                    Service Booking Team
+                </p>
+
+            </div>
+        """,
+    }
 
     # -----------------------------------------------------
     # SEND EMAIL
     # -----------------------------------------------------
 
-    message = EmailMessage()
-
-    message["Subject"] = "Service Booking - Password Reset"
-    message["From"] = smtp_username
-    message["To"] = user.email
-
-    message.set_content(
-        f"""
-Hello {user.name},
-
-We received a request to reset your Service Booking password.
-
-Use this link to reset your password:
-
-{reset_url}
-
-This link will expire in 30 minutes.
-
-If you did not request this, you can safely ignore this email.
-
-Regards,
-Service Booking Team
-"""
-    )
-
     try:
-        with smtplib.SMTP(
-            smtp_host,
-            smtp_port,
-            timeout=20,
-        ) as server:
+        email_response = resend.Emails.send(
+            params
+        )
 
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-
-            server.login(
-                smtp_username,
-                smtp_password,
-            )
-
-            server.send_message(message)
+        print(
+            "Password reset email sent:",
+            email_response,
+        )
 
     except Exception as exc:
+
         print(
             "Password reset email error:",
             exc,
@@ -358,7 +377,10 @@ Service Booking Team
         )
 
     return {
-        "message": "If this email exists, a password reset link has been sent."
+        "message": (
+            "If this email exists, "
+            "a password reset link has been sent."
+        )
     }
 
 
@@ -375,10 +397,18 @@ def reset_password(
     if len(new_password) < 6:
         raise HTTPException(
             status_code=400,
-            detail="Password must be at least 6 characters.",
+            detail=(
+                "Password must be at least "
+                "6 characters."
+            ),
         )
 
+    # -----------------------------------------------------
+    # VERIFY RESET TOKEN
+    # -----------------------------------------------------
+
     try:
+
         payload = jwt.decode(
             token,
             SECRET_KEY,
@@ -400,14 +430,31 @@ def reset_password(
             )
 
     except JWTError:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid or expired password reset token.",
         )
 
+    # -----------------------------------------------------
+    # FIND USER
+    # -----------------------------------------------------
+
+    try:
+        user_id = int(user_id)
+
+    except (TypeError, ValueError):
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid password reset token.",
+        )
+
     user = (
         db.query(User)
-        .filter(User.id == int(user_id))
+        .filter(
+            User.id == user_id
+        )
         .first()
     )
 
@@ -416,6 +463,10 @@ def reset_password(
             status_code=404,
             detail="User not found.",
         )
+
+    # -----------------------------------------------------
+    # UPDATE PASSWORD
+    # -----------------------------------------------------
 
     user.hashed_password = bcrypt.hashpw(
         new_password.encode("utf-8"),
@@ -450,7 +501,12 @@ def get_current_user(
 
     token = credentials.credentials
 
+    # -----------------------------------------------------
+    # DECODE JWT
+    # -----------------------------------------------------
+
     try:
+
         payload = jwt.decode(
             token,
             SECRET_KEY,
@@ -460,7 +516,10 @@ def get_current_user(
         if payload.get("exp") is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token: expiration missing",
+                detail=(
+                    "Invalid token: "
+                    "expiration missing"
+                ),
                 headers={
                     "WWW-Authenticate": "Bearer"
                 },
@@ -471,7 +530,10 @@ def get_current_user(
         if user_id is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token: user ID missing",
+                detail=(
+                    "Invalid token: "
+                    "user ID missing"
+                ),
                 headers={
                     "WWW-Authenticate": "Bearer"
                 },
@@ -479,16 +541,22 @@ def get_current_user(
 
         try:
             user_id = int(user_id)
+
         except (TypeError, ValueError):
+
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token: invalid user ID",
+                detail=(
+                    "Invalid token: "
+                    "invalid user ID"
+                ),
                 headers={
                     "WWW-Authenticate": "Bearer"
                 },
             )
 
     except JWTError:
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
@@ -503,7 +571,9 @@ def get_current_user(
 
     user = (
         db.query(User)
-        .filter(User.id == user_id)
+        .filter(
+            User.id == user_id
+        )
         .first()
     )
 
@@ -525,6 +595,8 @@ def get_current_user(
     response_model=UserResponse,
 )
 def me(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(
+        get_current_user
+    ),
 ):
     return current_user

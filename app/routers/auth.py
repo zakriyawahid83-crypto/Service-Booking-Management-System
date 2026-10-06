@@ -22,6 +22,9 @@ from app.auth_config import (
 )
 from app.models.user import User
 from app.models.provider import Provider
+import os
+import smtplib
+from email.message import EmailMessage
 from app.schemas.user import (
     Token,
     UserCreate,
@@ -213,6 +216,215 @@ def login(
         "token_type": "bearer",
         "user_id": db_user.id,
         "role": db_user.role,
+    }
+
+
+# =========================================================
+# FORGOT PASSWORD
+# =========================================================
+
+@router.post("/forgot-password")
+def forgot_password(
+    email: str,
+    db: Session = Depends(get_db),
+):
+    user = (
+        db.query(User)
+        .filter(User.email == email.strip())
+        .first()
+    )
+
+    # Do not reveal whether the email exists
+    if not user:
+        return {
+            "message": "If this email exists, a password reset link has been sent."
+        }
+
+    # -----------------------------------------------------
+    # CREATE RESET TOKEN
+    # -----------------------------------------------------
+
+    expire = (
+        datetime.now(timezone.utc)
+        + timedelta(minutes=30)
+    )
+
+    reset_token_data = {
+        "sub": str(user.id),
+        "purpose": "password_reset",
+        "exp": expire,
+    }
+
+    reset_token = jwt.encode(
+        reset_token_data,
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    # -----------------------------------------------------
+    # RESET URL
+    # -----------------------------------------------------
+
+    frontend_url = os.getenv(
+        "FRONTEND_URL",
+        "http://localhost:5173",
+    ).rstrip("/")
+
+    reset_url = (
+        f"{frontend_url}/reset-password"
+        f"?token={reset_token}"
+    )
+
+    # -----------------------------------------------------
+    # EMAIL SETTINGS
+    # -----------------------------------------------------
+
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(
+        os.getenv("SMTP_PORT", "587")
+    )
+    smtp_username = os.getenv("SMTP_USERNAME")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+
+    if not all(
+        [
+            smtp_host,
+            smtp_username,
+            smtp_password,
+        ]
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="Email service is not configured.",
+        )
+
+    # -----------------------------------------------------
+    # SEND EMAIL
+    # -----------------------------------------------------
+
+    message = EmailMessage()
+
+    message["Subject"] = "Service Booking - Password Reset"
+    message["From"] = smtp_username
+    message["To"] = user.email
+
+    message.set_content(
+        f"""
+Hello {user.name},
+
+We received a request to reset your Service Booking password.
+
+Use this link to reset your password:
+
+{reset_url}
+
+This link will expire in 30 minutes.
+
+If you did not request this, you can safely ignore this email.
+
+Regards,
+Service Booking Team
+"""
+    )
+
+    try:
+        with smtplib.SMTP(
+            smtp_host,
+            smtp_port,
+            timeout=20,
+        ) as server:
+
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+
+            server.login(
+                smtp_username,
+                smtp_password,
+            )
+
+            server.send_message(message)
+
+    except Exception as exc:
+        print(
+            "Password reset email error:",
+            exc,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to send password reset email.",
+        )
+
+    return {
+        "message": "If this email exists, a password reset link has been sent."
+    }
+
+
+# =========================================================
+# RESET PASSWORD
+# =========================================================
+
+@router.post("/reset-password")
+def reset_password(
+    token: str,
+    new_password: str,
+    db: Session = Depends(get_db),
+):
+    if len(new_password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 6 characters.",
+        )
+
+    try:
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+        )
+
+        if payload.get("purpose") != "password_reset":
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid password reset token.",
+            )
+
+        user_id = payload.get("sub")
+
+        if user_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid password reset token.",
+            )
+
+    except JWTError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired password reset token.",
+        )
+
+    user = (
+        db.query(User)
+        .filter(User.id == int(user_id))
+        .first()
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found.",
+        )
+
+    user.hashed_password = bcrypt.hashpw(
+        new_password.encode("utf-8"),
+        bcrypt.gensalt(),
+    ).decode("utf-8")
+
+    db.commit()
+
+    return {
+        "message": "Password reset successfully."
     }
 
 
